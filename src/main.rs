@@ -1,141 +1,76 @@
-use clap::{arg, ArgMatches, Command};
-use rusqlite::{Connection, OpenFlags, Result};
-use std::env;
-use std::num::ParseIntError;
+use clap::Command;
+use rusqlite::Result;
+use std::process;
 
-const ADD: &str = "add";
-const LIST: &str = "list";
-const DONE: &str = "done";
-const DELETE: &str = "delete";
-const DATABASE_NAME: &str = "data.db";
+mod cli;
+mod database;
+mod util;
 
-enum Error {
-    Message(String),
-}
-
-impl From<ParseIntError> for Error {
-    fn from(error: ParseIntError) -> Self {
-        Error::Message(format!("{}", error.to_string()))
-    }
-}
-
-impl From<rusqlite::Error> for Error {
-    fn from(error: rusqlite::Error) -> Self {
-        Error::Message(format!("{}", error.to_string()))
-    }
-}
-struct Database {
-    connection: Connection,
-    path: String,
-}
+#[derive(Debug)]
 struct Todo {
-    database: Database,
-}
-
-impl Database {
-    fn new() -> Result<Self> {
-        
-        let mut path = match env::var("HOME") {
-            Ok(val) => val,
-            Err(_) => ".".to_string(),
-        };
-        path += format!("/{}", DATABASE_NAME).as_str();
-
-        let connection = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        )?;
-
-        connection
-            .execute(
-                "CREATE TABLE todo (
-           id   INTEGER PRIMARY KEY,
-           task TEXT NOT NULL,
-           done BOOLEAN 
-       )",
-                (), // empty list of parameters.
-            )
-            .ok();
-
-        Ok(Self {
-            connection: connection,
-            path: path,
-        })
-    }
-
-    fn add(&self, task: String) -> Result<()> {
-        self.connection.execute(
-            "INSERT INTO todo (task, done) VALUES (?1, ?2)",
-            (&task, false),
-        )?;
-        println!("create task");
-        Ok(())
-    }
-
-    fn list(&self) -> Result<()> {
-        let mut stmt = self.connection.prepare("SELECT * FROM todo")?;
-        let todo_iter = stmt.query_map([], |row| {
-            let id = row.get::<_, i32>(0)?;
-            let task = row.get::<_, String>(1)?;
-            let done = row.get::<_, bool>(2)?;
-            Ok((id, task, done))
-        })?;
-
-        for todo in todo_iter {
-            let todo = todo?;
-            println!(
-                "{} {}: {}",
-                if todo.2 { "\u{2611}" } else { "\u{2610}" },
-                todo.0,
-                todo.1,
-            );
-        }
-
-        Ok(())
-   }
-
-    fn done(&self, i: u8) -> Result<()> {
-        let mut stmt = self
-            .connection
-            .prepare("UPDATE todo SET done=true WHERE id=:i;")?;
-        let _done = stmt.query_row(&[(":i", i.to_string().as_str())], |row| {
-            row.get::<_, i32>(0)
-        })?;
-
-        Ok(())
-    }
-
-    fn delete(&self, i: u8) -> Result<()> {
-        let mut stmt = self.connection.prepare("DELETE FROM todo WHERE id=:i;")?;
-        let _delete = stmt.query_row(&[(":i", i.to_string().as_str())], |row| {
-            row.get::<_, i32>(0)
-        })?;
-        Ok(())
-    }
+    database: database::Database,
 }
 
 impl Todo {
-    fn new() -> Result<Self> {
-        let database = Database::new()?;
-        Ok(Self { database })
+    // Initialize Todo
+    fn new() -> Self {
+        let database = match database::Database::new() {
+            Ok(database) => database,
+            Err(e) => panic!("{}", e),
+        };
+        Todo { database: database }
     }
 
-    fn run(&self, commands: Command<'static>) -> Result<(), Error> {
+    fn run(&self, commands: Command<'static>) -> Result<(), util::Error> {
         match commands.get_matches().subcommand().unwrap() {
-            (ADD, s) => {
+            (cli::ADD, s) => {
                 let task = s.value_of("TASK").unwrap().to_string();
-                self.database.add(task).ok();
+                //conn.add
+
+                match self.database.add(task) {
+                    Ok(_) => println!("added successfully"),
+                    Err(e) => eprintln!("failed to add a task: {}", e),
+                }
             }
-            (DONE, i) => {
-                let id = parse_index(i)?;
-                self.database.done(id).ok();
+            (cli::DONE, i) => {
+                let i = util::parse_index(i)?;
+                let mut stmt = self.database.done(i)?;
+
+                let _done = stmt.query_row(&[(":i", i.to_string().as_str())], |row| {
+                    Ok(row.get::<_, i32>(0))
+                });
             }
-            (LIST, _) => {
-                self.database.list().ok();
+
+            (cli::DELETE, i) => {
+                let i = util::parse_index(i)?;
+                let mut stmt = self.database.delete(i)?;
+
+                let _delete = stmt.query_row(&[(":i", i.to_string().as_str())], |row| {
+                    Ok(row.get::<_, i32>(0))
+                });
             }
-            (DELETE, i) => {
-                let id = parse_index(i)?;
-                self.database.delete(id).ok();
+
+            (cli::LIST, _) => {
+                let mut stmt = self.database.list().unwrap_or_else(|e| {
+                    eprint!("failed to show todo list: {}", e);
+                    process::exit(1);
+                });
+                let todo_iter = stmt.query_map([], |row| {
+                    let id = row.get::<_, i32>(0)?;
+                    let task = row.get::<_, String>(1)?;
+                    let done = row.get::<_, bool>(2)?;
+                    Ok((id, task, done))
+                })?;
+
+                for todo in todo_iter {
+                    let todo = todo?;
+                    println!(
+                        "{} {}: {}",
+                        if todo.2 { "\u{2611}" } else { "\u{2610}" },
+                        todo.0,
+                        todo.1,
+                    );
+                }
             }
             _ => unreachable!(),
         };
@@ -143,40 +78,12 @@ impl Todo {
     }
 }
 
-fn parse_index(arg: &ArgMatches) -> Result<u8, Error> {
-    Ok(arg.value_of("INDEX").unwrap().parse::<u8>()?)
+fn main() {
+    let commands = cli::build_args();
+
+    let todo = Todo::new();
+    match todo.run(commands) {
+        Ok(()) => (),
+        Err(e) => panic!("{:?}", e),
+    };
 }
-
-fn build_args() -> Command<'static> {
-    Command::new("todo")
-        .about("simple command line save in database")
-        .subcommand_required(true)
-        .arg_required_else_help(true)
-        .subcommand(
-            Command::new(ADD)
-                .about("Add new task")
-                .arg(arg!(<TASK>).required(true)),
-        )
-        .subcommand(
-            Command::new(DONE)
-                .about("done a task")
-                .arg(arg!(<INDEX>).required(true)),
-        )
-        .subcommand(
-            Command::new(DELETE)
-                .about("done a task")
-                .arg(arg!(<INDEX>).required(true)),
-        )
-        .subcommand(Command::new(LIST).about("list the tasks"))
-}
-
-fn main() -> Result<()> {
-    let todo = Todo::new()?;
-
-    let commands = build_args();
-
-    todo.run(commands).ok();
-
-    Ok(())
-}
-
