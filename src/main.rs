@@ -25,7 +25,6 @@ impl Todo {
         match commands.get_matches().subcommand().unwrap() {
             (cli::ADD, s) => {
                 let task = s.value_of("TASK").unwrap().to_string();
-                //conn.add
 
                 match self.database.add(task) {
                     Ok(_) => println!("added successfully"),
